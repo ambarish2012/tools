@@ -38,11 +38,13 @@ public class Main {
     private static HashMap<String, HashSet<String>> privateBuiltProjectIdsByDate = new HashMap<>();
     private static HashMap<String, HashSet<String>> privateFailedBuildProjectIdsByDate = new HashMap<>();
 
-    private static HashSet<String> failedBuildsProjectIds = new HashSet<>();
-    private static HashMap<String, String> projectRunId = new HashMap<>();
+    private static Set<String> failedBuildsProjectIds = ConcurrentHashMap.newKeySet();
+    private static ConcurrentHashMap<String, String> projectRunId = new ConcurrentHashMap<>();
     private static HashSet<String> noYmlFoundProjectIds = new HashSet<>();
     private static HashMap<String, String> projectIdYml = new HashMap<>();
     private static ConcurrentHashMap<String, String> projectAccountIdMap = new ConcurrentHashMap<String, String>();
+    private static ConcurrentHashMap<String, String> projectDateMap = new ConcurrentHashMap<String, String>();
+
 
     private static HashMap<String, String> accountProjectIdMap = new HashMap<>();
     private static HashMap<String, String> accountEmailMap = new HashMap<>();
@@ -68,7 +70,6 @@ public class Main {
         init();
         connectToMongo();
 
-
         getNewAccounts(numDaysToTrack);
         getProjectMetaData();
         getRunStatus();
@@ -82,33 +83,37 @@ public class Main {
     }
 
     private static void writeToMongo() {
-        Iterator it = privateFailedBuildProjectIdsByDate.entrySet().iterator();
+        // build map by date
+        for (String projectId : failedBuildsProjectIds) {
+            String date = projectDateMap.get(projectId);
+            privateFailedBuildProjectIdsByDate.computeIfAbsent(date, projectIds -> new HashSet<>()).add(projectId);
+        }
 
+        Iterator it = privateFailedBuildProjectIdsByDate.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry pair = (Map.Entry) it.next();
             HashSet<String> projectIds = (HashSet<String>) pair.getValue();
 
             MongoCollection<Document> collection = database.getCollection((String)pair.getKey());
+            if (collection.count()  == 0 ) {
+                collection.createIndex(Indexes.ascending("projectid"));
 
-            collection.dropIndexes();
-            collection.drop();
+                for (String projectId : projectIds) {
+                    Document doc = new Document("projectid", projectId)
+                            .append("accountid", projectAccountIdMap.get(projectId))
+                            .append("lastrunid", projectRunId.get(projectId))
+                            .append("email", getEmailId(projectAccountIdMap.get(projectId)));
 
-            collection.createIndex(Indexes.ascending("projectid"));
+                    if (noYmlFoundProjectIds.contains(projectId)) {
+                        doc.append("noyml", true);
+                    }
 
-            for (String projectId : projectIds) {
-                Document doc = new Document("projectid", projectId)
-                        .append("accountid", projectAccountIdMap.get(projectId))
-                        .append("lastrunid", projectRunId.get(projectId));
+                    if (projectIdYml.containsKey(projectId)) {
+                        doc.append("yml", projectIdYml.get(projectId));
+                    }
 
-                if (noYmlFoundProjectIds.contains(projectId)) {
-                    doc.append("noyml", true);
+                    collection.insertOne(doc);
                 }
-
-                if (projectIdYml.containsKey(projectId)) {
-                    doc.append("yml", projectIdYml.get(projectId));
-                }
-
-                collection.insertOne(doc);
             }
         }
     }
@@ -116,36 +121,44 @@ public class Main {
     private static void detectNoYml() {
         String url = "https://api.shippable.com/runs/%s";
 
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
+
         Iterator it = projectRunId.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry pair = (Map.Entry) it.next();
 
-            String projectId = (String) pair.getKey();
-            String runId = (String) pair.getValue();
+            executor.execute(() -> {
+                String projectId = (String) pair.getKey();
+                String runId = (String) pair.getValue();
 
-            String json = makeGetRestCall(String.format(url, runId));
-            JSONObject jsonObject = new JSONObject(json);
-            JSONObject yml = jsonObject.getJSONObject("cleanRunYml");
+                String json = makeGetRestCall(String.format(url, runId));
+                JSONObject jsonObject = new JSONObject(json);
+                JSONObject yml = jsonObject.getJSONObject("cleanRunYml");
 
-            if ((yml != null) && (yml.length() > 0)) {
-                projectIdYml.putIfAbsent(projectId, yml.toString());
-            } else {
-                noYmlFoundProjectIds.add(projectId);
-            }
+                if ((yml != null) && (yml.length() > 0)) {
+                    projectIdYml.putIfAbsent(projectId, yml.toString());
+                } else {
+                    noYmlFoundProjectIds.add(projectId);
+                }
+            });
+        }
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            logger.log(Level.SEVERE, "failure in detectNoYml " + e.getMessage());
         }
     }
 
     private static void getRunStatus() {
         String url = "https://api.shippable.com/runs?projectIds=%s";
-        Iterator it = privateBuiltProjectIdsByDate.entrySet().iterator();
 
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry)it.next();
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
 
-            HashSet<String> builtProjectIds = (HashSet<String>) pair.getValue();
-            HashSet<String> buildFailureProjectIds = new HashSet<>();
-
-            for (String projectId : builtProjectIds) {
+        for (Map.Entry<String, String> entry : projectDateMap.entrySet()) {
+            executor.execute(() -> {
+                String projectId = entry.getKey();
                 String json = makeGetRestCall(String.format(url, projectId));
                 String runId = null;
 
@@ -161,53 +174,67 @@ public class Main {
                     int statusCode = jsonObject.getInt("statusCode");
 
                     if (statusCode == 30 || statusCode == 40) {
-                        buildFailureProjectIds.remove(projectId);
+                        failedBuildsProjectIds.remove(projectId);
                         projectRunId.remove(projectId);
                         break;
                     } else if (statusCode == 80) {
-                        buildFailureProjectIds.add(projectId);
-                        projectRunId.putIfAbsent(projectId, runId);
+                        failedBuildsProjectIds.add(projectId);
+                        projectRunId.put(projectId, runId);
                     }
                 }
-            }
+            });
+        }
 
-            if (buildFailureProjectIds.size() > 0) {
-                String collectionKey = (String)pair.getKey();
-                privateFailedBuildProjectIdsByDate.put(collectionKey, buildFailureProjectIds);
-                failedBuildsProjectIds.addAll(buildFailureProjectIds);
-            }
-       }
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            logger.log(Level.SEVERE, "failure in getRunStatus " + e.getMessage());
+        }
     }
 
     private static void getProjectMetaData() {
         String url = "https://api.shippable.com/projects?projectIds=***&enabledBy=%s&autoBuild=true";
 
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
+
         Iterator it = accountIdsByDate.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry pair = (Map.Entry)it.next();
-            System.out.println(pair.getKey() + " = " + pair.getValue());
+            String key = (String)pair.getKey();
 
-            HashSet<String> accountIds = (HashSet<String>) pair.getValue();
-            HashSet<String> builtProjectIds = new HashSet<>();
+            if (database.getCollection(key).count() == 0) {
+                HashSet<String> accountIds = (HashSet<String>) pair.getValue();
 
-            for (String accountId: accountIds) {
-                String json = makeGetRestCall(String.format(url, accountId));
+                for (String accountId : accountIds) {
+                    executor.execute(() -> {
+                        String json = makeGetRestCall(String.format(url, accountId));
 
-                JSONArray jsonArr = new JSONArray(json);
-                for (int index = 0; index < jsonArr.length(); index++) {
-                    JSONObject jsonObject = jsonArr.getJSONObject(index);
-                    if (jsonObject.getBoolean("isPrivateRepository")) {
-                        int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
-                        System.out.println(lastBuildGroupNumber);
-                        if (lastBuildGroupNumber > 0) {
-                            builtProjectIds.add(jsonObject.getString("id"));
-                            projectAccountIdMap.putIfAbsent(jsonObject.getString("id"), accountId);
+                        JSONArray jsonArr = new JSONArray(json);
+                        for (int index = 0; index < jsonArr.length(); index++) {
+                            JSONObject jsonObject = jsonArr.getJSONObject(index);
+                            if (jsonObject.getBoolean("isPrivateRepository")) {
+                                int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
+                                if (lastBuildGroupNumber > 0) {
+                                    String projectId = jsonObject.getString("id");
+
+                                    projectDateMap.put(projectId, key);
+                                    projectAccountIdMap.put(projectId, accountId);
+                                }
+                            }
                         }
-                    }
+                    });
                 }
+            } else {
+                logger.log(Level.INFO, "skipping analysis for date " + key);
             }
+        }
 
-            privateBuiltProjectIdsByDate.put((String)pair.getKey(), builtProjectIds);
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            logger.log(Level.SEVERE, "failure in getProjectMetaData " + e.getMessage());
         }
     }
 
@@ -513,6 +540,14 @@ public class Main {
         }
 
         return emailIds;
+    }
+
+    private static String getEmailId(String accountId) {
+        StringBuilder url = new StringBuilder("https://api.shippable.com/accountProfiles/?accountIds=");
+        url.append(accountId);
+
+        String json = makeGetRestCall(url.toString());
+        return new JSONArray(json).getJSONObject(0).getString("defaultEmailId");
     }
 
     private static void dumpConsoleLogsForFailedBuilds(String accountId) {
