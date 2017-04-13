@@ -1,13 +1,28 @@
 package com.company;
 
+import com.mongodb.client.model.Indexes;
 import org.apache.http.client.fluent.Request;
+import com.mongodb.MongoClient;
+import com.mongodb.MongoClientURI;
+import com.mongodb.ServerAddress;
 
-import java.io.Console;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.MongoCollection;
+
+import org.bson.Document;
+import com.mongodb.Block;
+
+import com.mongodb.client.MongoCursor;
+import static com.mongodb.client.model.Filters.*;
+import com.mongodb.client.result.DeleteResult;
+import static com.mongodb.client.model.Updates.*;
+import com.mongodb.client.result.UpdateResult;
+
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.Formatter;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -27,6 +42,7 @@ public class Main {
     private static HashMap<String, String> projectRunId = new HashMap<>();
     private static HashSet<String> noYmlFoundProjectIds = new HashSet<>();
     private static HashMap<String, String> projectIdYml = new HashMap<>();
+    private static ConcurrentHashMap<String, String> projectAccountIdMap = new ConcurrentHashMap<String, String>();
 
     private static HashMap<String, String> accountProjectIdMap = new HashMap<>();
     private static HashMap<String, String> accountEmailMap = new HashMap<>();
@@ -41,6 +57,8 @@ public class Main {
     private final static Logger logger = Logger.getLogger(Main.class.getName());
     private static FileHandler fh = null;
     private static String apiToken;
+    private static MongoClient mongoClient = null;
+    private static MongoDatabase database = null;
 
 
     public static void main(String[] args) throws ParseException {
@@ -48,18 +66,196 @@ public class Main {
         int numDaysToTrack = Integer.parseInt(args[1]);
 
         init();
+        connectToMongo();
 
-        /*
+
         getNewAccounts(numDaysToTrack);
         getProjectMetaData();
         getRunStatus();
         detectNoYml();
+        writeToMongo();
 
         logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
         logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
-        */
 
-        detectFailedBuilds(numDaysToTrack);
+        // detectFailedBuilds(numDaysToTrack);
+    }
+
+    private static void writeToMongo() {
+        Iterator it = privateFailedBuildProjectIdsByDate.entrySet().iterator();
+
+        while (it.hasNext()) {
+            Map.Entry pair = (Map.Entry) it.next();
+            HashSet<String> projectIds = (HashSet<String>) pair.getValue();
+
+            MongoCollection<Document> collection = database.getCollection((String)pair.getKey());
+
+            collection.dropIndexes();
+            collection.drop();
+
+            collection.createIndex(Indexes.ascending("projectid"));
+
+            for (String projectId : projectIds) {
+                Document doc = new Document("projectid", projectId)
+                        .append("accountid", projectAccountIdMap.get(projectId))
+                        .append("lastrunid", projectRunId.get(projectId));
+
+                if (noYmlFoundProjectIds.contains(projectId)) {
+                    doc.append("noyml", true);
+                }
+
+                if (projectIdYml.containsKey(projectId)) {
+                    doc.append("yml", projectIdYml.get(projectId));
+                }
+
+                collection.insertOne(doc);
+            }
+        }
+    }
+
+    private static void detectNoYml() {
+        String url = "https://api.shippable.com/runs/%s";
+
+        Iterator it = projectRunId.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry pair = (Map.Entry) it.next();
+
+            String projectId = (String) pair.getKey();
+            String runId = (String) pair.getValue();
+
+            String json = makeGetRestCall(String.format(url, runId));
+            JSONObject jsonObject = new JSONObject(json);
+            JSONObject yml = jsonObject.getJSONObject("cleanRunYml");
+
+            if ((yml != null) && (yml.length() > 0)) {
+                projectIdYml.putIfAbsent(projectId, yml.toString());
+            } else {
+                noYmlFoundProjectIds.add(projectId);
+            }
+        }
+    }
+
+    private static void getRunStatus() {
+        String url = "https://api.shippable.com/runs?projectIds=%s";
+        Iterator it = privateBuiltProjectIdsByDate.entrySet().iterator();
+
+        while (it.hasNext()) {
+            Map.Entry pair = (Map.Entry)it.next();
+
+            HashSet<String> builtProjectIds = (HashSet<String>) pair.getValue();
+            HashSet<String> buildFailureProjectIds = new HashSet<>();
+
+            for (String projectId : builtProjectIds) {
+                String json = makeGetRestCall(String.format(url, projectId));
+                String runId = null;
+
+                JSONArray jsonArr = new JSONArray(json);
+                for (int index = 0; index < jsonArr.length(); index++) {
+                    JSONObject jsonObject = jsonArr.getJSONObject(index);
+
+                    // store the first run number for yml check
+                    if (runId == null) {
+                        runId = jsonObject.getString("id");
+                    }
+
+                    int statusCode = jsonObject.getInt("statusCode");
+
+                    if (statusCode == 30 || statusCode == 40) {
+                        buildFailureProjectIds.remove(projectId);
+                        projectRunId.remove(projectId);
+                        break;
+                    } else if (statusCode == 80) {
+                        buildFailureProjectIds.add(projectId);
+                        projectRunId.putIfAbsent(projectId, runId);
+                    }
+                }
+            }
+
+            if (buildFailureProjectIds.size() > 0) {
+                String collectionKey = (String)pair.getKey();
+                privateFailedBuildProjectIdsByDate.put(collectionKey, buildFailureProjectIds);
+                failedBuildsProjectIds.addAll(buildFailureProjectIds);
+            }
+       }
+    }
+
+    private static void getProjectMetaData() {
+        String url = "https://api.shippable.com/projects?projectIds=***&enabledBy=%s&autoBuild=true";
+
+        Iterator it = accountIdsByDate.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry pair = (Map.Entry)it.next();
+            System.out.println(pair.getKey() + " = " + pair.getValue());
+
+            HashSet<String> accountIds = (HashSet<String>) pair.getValue();
+            HashSet<String> builtProjectIds = new HashSet<>();
+
+            for (String accountId: accountIds) {
+                String json = makeGetRestCall(String.format(url, accountId));
+
+                JSONArray jsonArr = new JSONArray(json);
+                for (int index = 0; index < jsonArr.length(); index++) {
+                    JSONObject jsonObject = jsonArr.getJSONObject(index);
+                    if (jsonObject.getBoolean("isPrivateRepository")) {
+                        int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
+                        System.out.println(lastBuildGroupNumber);
+                        if (lastBuildGroupNumber > 0) {
+                            builtProjectIds.add(jsonObject.getString("id"));
+                            projectAccountIdMap.putIfAbsent(jsonObject.getString("id"), accountId);
+                        }
+                    }
+                }
+            }
+
+            privateBuiltProjectIdsByDate.put((String)pair.getKey(), builtProjectIds);
+        }
+    }
+
+    private static HashSet<String> getNewAccounts(int noDaysSinceToday) throws ParseException {
+        // today
+        Calendar date = new GregorianCalendar();
+        // reset hour, minutes, seconds and millis
+        date.set(Calendar.HOUR_OF_DAY, 0);
+        date.set(Calendar.MINUTE, 0);
+        date.set(Calendar.SECOND, 0);
+        date.set(Calendar.MILLISECOND, 0);
+        Date today = date.getTime();
+
+        HashSet<String> accountIds = new HashSet<>();
+        HashSet<String> accIdsByDate = new HashSet<>();
+
+        String json =  makeGetRestCall("https://api.shippable.com/accountTokens?accountIds=***&isInternal=true&limit=100");
+        int dayIndex = 0;
+
+        JSONArray jsonArr = new JSONArray(json);
+        for (int index = 0; index < jsonArr.length(); index++) {
+            JSONObject jsonObject = jsonArr.getJSONObject(index);
+
+            String accountId = jsonObject.getString("accountId");
+
+            SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+            format.setTimeZone(TimeZone.getTimeZone("UTC"));
+            Date createdAt =  format.parse(jsonObject.getString("createdAt"));
+
+            if (!createdAt.after(today)) {
+                String todayStr = getFormattedDateString(today);
+                accountIdsByDate.put(todayStr, new HashSet<>(accIdsByDate));
+
+                accIdsByDate.clear();
+                dayIndex++;
+                if (dayIndex >= noDaysSinceToday) {
+                    break;
+                }
+
+                date.add(Calendar.DAY_OF_MONTH, -1);
+                today = date.getTime();
+            }
+
+            accountIds.add(accountId);
+            accIdsByDate.add(accountId);
+        }
+
+        return accountIds;
     }
 
     public static void detectFailedBuilds(int numDays) throws ParseException{
@@ -175,70 +371,6 @@ public class Main {
                 + status80.size());
     }
 
-    private static void detectNoYml() {
-        String url = "https://api.shippable.com/runs/%s";
-
-        Iterator it = projectRunId.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry) it.next();
-            String projectId = (String) pair.getValue();
-
-            String json = makeGetRestCall(String.format(url, projectId));
-            JSONObject jsonObject = new JSONObject(json);
-            JSONObject yml = jsonObject.getJSONObject("cleanRunYml");
-            if ((yml != null) && (yml.length() > 0)) {
-                // add to mongo to track
-                projectIdYml.putIfAbsent(projectId, yml.toString());
-            } else {
-                noYmlFoundProjectIds.add(projectId);
-            }
-        }
-    }
-
-    private static void getRunStatus() {
-        String url = "https://api.shippable.com/runs?projectIds=%s";
-        Iterator it = privateBuiltProjectIdsByDate.entrySet().iterator();
-
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry)it.next();
-
-            HashSet<String> builtProjectIds = (HashSet<String>) pair.getValue();
-            HashSet<String> buildFailureProjectIds = new HashSet<>();
-
-            for (String projectId : builtProjectIds) {
-                String json = makeGetRestCall(String.format(url, projectId));
-                String runId = null;
-
-                JSONArray jsonArr = new JSONArray(json);
-                for (int index = 0; index < jsonArr.length(); index++) {
-                    JSONObject jsonObject = jsonArr.getJSONObject(index);
-
-                    // store the first run number for yml check
-                    if (runId == null) {
-                        runId = jsonObject.getString("id");
-                    }
-
-                    int statusCode = jsonObject.getInt("statusCode");
-
-                    if (statusCode == 30 || statusCode == 40) {
-                        buildFailureProjectIds.remove(projectId);
-                        projectRunId.remove(projectId);
-                        break;
-                    } else if (statusCode == 80) {
-                        buildFailureProjectIds.add(projectId);
-                        projectRunId.putIfAbsent(projectId, runId);
-                    }
-                }
-            }
-
-            if (buildFailureProjectIds.size() > 0) {
-                // write to mongo db
-                privateFailedBuildProjectIdsByDate.put((String)pair.getKey(), buildFailureProjectIds);
-                failedBuildsProjectIds.addAll(buildFailureProjectIds);
-            }
-        }
-    }
-
     private static void getRunStatus(HashSet<String> accountIds) {
         String url = "https://api.shippable.com/projects/%s/branchRunStatus";
 
@@ -272,38 +404,6 @@ public class Main {
             executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             logger.log(Level.SEVERE, "failure in getRunStatus " + e.getMessage());
-        }
-    }
-
-    private static void getProjectMetaData() {
-        String url = "https://api.shippable.com/projects?projectIds=***&enabledBy=%s&autoBuild=true";
-
-        Iterator it = accountIdsByDate.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry)it.next();
-            System.out.println(pair.getKey() + " = " + pair.getValue());
-
-            HashSet<String> accountIds = (HashSet<String>) pair.getValue();
-            HashSet<String> builtProjectIds = new HashSet<>();
-
-            for (String accountId: accountIds) {
-                String json = makeGetRestCall(String.format(url, accountId));
-
-                JSONArray jsonArr = new JSONArray(json);
-                for (int index = 0; index < jsonArr.length(); index++) {
-                    JSONObject jsonObject = jsonArr.getJSONObject(index);
-                    if (jsonObject.getBoolean("isPrivateRepository")) {
-                        int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
-                        System.out.println(lastBuildGroupNumber);
-                        if (lastBuildGroupNumber > 0) {
-                            builtProjectIds.add(jsonObject.getString("id"));
-                            accountProjectIdMap.put(accountId, jsonObject.getString("id"));
-                        }
-                    }
-                }
-            }
-
-            privateBuiltProjectIdsByDate.put((String)pair.getKey(), builtProjectIds);
         }
     }
 
@@ -343,53 +443,6 @@ public class Main {
         } catch (InterruptedException e) {
             logger.log(Level.SEVERE, "failure in getProjectMetaData " + e.getMessage());
         }
-    }
-
-    private static HashSet<String> getNewAccounts(int noDaysSinceToday) throws ParseException {
-        // today
-        Calendar date = new GregorianCalendar();
-        // reset hour, minutes, seconds and millis
-        date.set(Calendar.HOUR_OF_DAY, 0);
-        date.set(Calendar.MINUTE, 0);
-        date.set(Calendar.SECOND, 0);
-        date.set(Calendar.MILLISECOND, 0);
-        Date today = date.getTime();
-
-        HashSet<String> accountIds = new HashSet<>();
-        HashSet<String> accIdsByDate = new HashSet<>();
-
-        String json =  makeGetRestCall("https://api.shippable.com/accountTokens?accountIds=***&isInternal=true&limit=100");
-        int dayIndex = 0;
-
-        JSONArray jsonArr = new JSONArray(json);
-        for (int index = 0; index < jsonArr.length(); index++) {
-            JSONObject jsonObject = jsonArr.getJSONObject(index);
-
-            String accountId = jsonObject.getString("accountId");
-
-            SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
-            format.setTimeZone(TimeZone.getTimeZone("UTC"));
-            Date createdAt =  format.parse(jsonObject.getString("createdAt"));
-
-            if (!createdAt.after(today)) {
-                String todayStr = getFormattedDateString(today);
-                accountIdsByDate.put(todayStr, new HashSet<>(accIdsByDate));
-
-                accIdsByDate.clear();
-                dayIndex++;
-                if (dayIndex >= noDaysSinceToday) {
-                    break;
-                }
-
-                date.add(Calendar.DAY_OF_MONTH, -1);
-                today = date.getTime();
-            }
-
-            accountIds.add(accountId);
-            accIdsByDate.add(accountId);
-        }
-
-        return accountIds;
     }
 
     private static String getFormattedDateString(Date date) {
@@ -554,4 +607,10 @@ public class Main {
             return null;
         }
     }
+
+    public static void connectToMongo() {
+        mongoClient = new MongoClient( "localhost" , 27017 );
+        database = mongoClient.getDatabase("buildfailures");
+    }
+
 }
