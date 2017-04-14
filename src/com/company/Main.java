@@ -3,29 +3,15 @@ package com.company;
 import com.mongodb.client.model.Indexes;
 import org.apache.http.client.fluent.Request;
 import com.mongodb.MongoClient;
-import com.mongodb.MongoClientURI;
-import com.mongodb.ServerAddress;
-
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.MongoCollection;
-
 import org.bson.Document;
-import com.mongodb.Block;
-
-import com.mongodb.client.MongoCursor;
-import static com.mongodb.client.model.Filters.*;
-import com.mongodb.client.result.DeleteResult;
-import static com.mongodb.client.model.Updates.*;
-import com.mongodb.client.result.UpdateResult;
 
 import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.*;
 
 import org.json.*;
@@ -35,73 +21,91 @@ public class Main {
     private static HashSet<String> privateNonBuiltAccountIds = new HashSet<>();
 
     private static HashMap<String, HashSet<String>> accountIdsByDate = new HashMap<>();
-    private static HashMap<String, HashSet<String>> privateBuiltProjectIdsByDate = new HashMap<>();
-    private static HashMap<String, HashSet<String>> privateFailedBuildProjectIdsByDate = new HashMap<>();
+    private static Map<String, HashSet<String>> privateFailedBuildProjectIdsByDate = new HashMap<>();
+    private static Map<String, HashSet<String>> privateSuccessfulBuildProjectIdsByDate = new HashMap<>();
+    private static Map<String, HashSet<String>> privateNonBuiltProjectIdsByDate = new HashMap<>();
+
+    private static Map<String, String> nonBuiltProjectIdMap = new ConcurrentHashMap<>();
+    private static ConcurrentHashMap<String, String> projectAccountIdMap = new ConcurrentHashMap<>();
+    private static ConcurrentHashMap<String, String> builtProjectDateMap = new ConcurrentHashMap<>();
 
     private static Set<String> failedBuildsProjectIds = ConcurrentHashMap.newKeySet();
+    private static Set<String> successfulBuildsProjectIds = ConcurrentHashMap.newKeySet();
+
     private static ConcurrentHashMap<String, String> projectRunId = new ConcurrentHashMap<>();
     private static HashSet<String> noYmlFoundProjectIds = new HashSet<>();
     private static HashMap<String, String> projectIdYml = new HashMap<>();
-    private static ConcurrentHashMap<String, String> projectAccountIdMap = new ConcurrentHashMap<String, String>();
-    private static ConcurrentHashMap<String, String> projectDateMap = new ConcurrentHashMap<String, String>();
-
 
     private static HashMap<String, String> accountProjectIdMap = new HashMap<>();
     private static HashMap<String, String> accountEmailMap = new HashMap<>();
-    private static HashMap<String, Integer> accountOtherStatusCodeMap = new HashMap<>();
 
-    private static HashSet<String> successfulBuildsAccountIds = new HashSet<>();
-    private static HashSet<String> failedBuildsAccountIds = new HashSet<>();
-    private static HashSet<String> hittingQuotaAccountIds = new HashSet<>();
-    private static HashSet<String> unstableQuotaAccountIds = new HashSet<>();
+    private static Set<String> successfulBuildsAccountIds = ConcurrentHashMap.newKeySet();
+    private static Set<String> failedBuildsAccountIds = ConcurrentHashMap.newKeySet();
     private static HashSet<String> noYmlFoundAccountIds = new HashSet<>();
 
     private final static Logger logger = Logger.getLogger(Main.class.getName());
     private static FileHandler fh = null;
     private static String apiToken;
     private static MongoClient mongoClient = null;
-    private static MongoDatabase database = null;
-
+    private static MongoDatabase failedBuildsDatabase = null;
+    private static MongoDatabase greenBuildsDatabase = null;
+    private static MongoDatabase noBuildsDatabase = null;
 
     public static void main(String[] args) throws ParseException {
         apiToken = args[0];
         int numDaysToTrack = Integer.parseInt(args[1]);
+        int option = Integer.parseInt(args[2]);
 
         init();
-        connectToMongo();
 
-        getNewAccounts(numDaysToTrack);
-        getProjectMetaData();
-        getRunStatus();
-        detectNoYml();
-        writeToMongo();
+        if (option == 1) {
+            connectToMongo();
 
-        logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
-        logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
+            getNewAccounts(numDaysToTrack);
+            getProjectMetaData();
+            getRunStatus();
+            detectNoYml();
+            writeToMongo();
 
-        // detectFailedBuilds(numDaysToTrack);
+            logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
+            logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
+        } else {
+            detectFailedBuilds(numDaysToTrack);
+        }
     }
 
     private static void writeToMongo() {
-        // build map by date
         for (String projectId : failedBuildsProjectIds) {
-            String date = projectDateMap.get(projectId);
+            String date = builtProjectDateMap.get(projectId);
             privateFailedBuildProjectIdsByDate.computeIfAbsent(date, projectIds -> new HashSet<>()).add(projectId);
         }
 
-        Iterator it = privateFailedBuildProjectIdsByDate.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry) it.next();
-            HashSet<String> projectIds = (HashSet<String>) pair.getValue();
+        for (String projectId : successfulBuildsProjectIds) {
+            String date = builtProjectDateMap.get(projectId);
+            privateSuccessfulBuildProjectIdsByDate.computeIfAbsent(date, projectIds -> new HashSet<>()).add(projectId);
+        }
 
-            MongoCollection<Document> collection = database.getCollection((String)pair.getKey());
+        for (Map.Entry<String, String> entry : nonBuiltProjectIdMap.entrySet()) {
+            privateNonBuiltProjectIdsByDate.computeIfAbsent(entry.getValue(), projectIds -> new HashSet<>())
+                    .add(entry.getKey());
+        }
+
+        insertMongoDocumentForCollection(privateFailedBuildProjectIdsByDate, failedBuildsDatabase);
+        insertMongoDocumentForCollection(privateSuccessfulBuildProjectIdsByDate, greenBuildsDatabase);
+        insertMongoDocumentForCollection(privateNonBuiltProjectIdsByDate, noBuildsDatabase);
+    }
+
+    private static void insertMongoDocumentForCollection(Map<String, HashSet<String>> map, MongoDatabase database) {
+        for (Map.Entry<String, HashSet<String>> entry : map.entrySet()) {
+            HashSet<String> projectIds = entry.getValue();
+
+            MongoCollection<Document> collection = database.getCollection(entry.getKey());
             if (collection.count()  == 0 ) {
                 collection.createIndex(Indexes.ascending("projectid"));
 
                 for (String projectId : projectIds) {
                     Document doc = new Document("projectid", projectId)
                             .append("accountid", projectAccountIdMap.get(projectId))
-                            .append("lastrunid", projectRunId.get(projectId))
                             .append("email", getEmailId(projectAccountIdMap.get(projectId)));
 
                     if (noYmlFoundProjectIds.contains(projectId)) {
@@ -112,24 +116,26 @@ public class Main {
                         doc.append("yml", projectIdYml.get(projectId));
                     }
 
+                    if (projectRunId.containsKey(projectId)) {
+                        doc.append("lastrunid", projectRunId.get(projectId));
+                    }
+
                     collection.insertOne(doc);
                 }
             }
         }
     }
 
+
     private static void detectNoYml() {
         String url = "https://api.shippable.com/runs/%s";
 
         ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
 
-        Iterator it = projectRunId.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry) it.next();
-
+        for (Map.Entry<String, String> entry : projectRunId.entrySet()) {
             executor.execute(() -> {
-                String projectId = (String) pair.getKey();
-                String runId = (String) pair.getValue();
+                String projectId = entry.getKey();
+                String runId = entry.getValue();
 
                 String json = makeGetRestCall(String.format(url, runId));
                 JSONObject jsonObject = new JSONObject(json);
@@ -156,7 +162,7 @@ public class Main {
 
         ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
 
-        for (Map.Entry<String, String> entry : projectDateMap.entrySet()) {
+        for (Map.Entry<String, String> entry : builtProjectDateMap.entrySet()) {
             executor.execute(() -> {
                 String projectId = entry.getKey();
                 String json = makeGetRestCall(String.format(url, projectId));
@@ -176,8 +182,13 @@ public class Main {
                     if (statusCode == 30 || statusCode == 40) {
                         failedBuildsProjectIds.remove(projectId);
                         projectRunId.remove(projectId);
+
+                        if (statusCode == 30) {
+                            successfulBuildsAccountIds.add(projectId);
+                        }
+
                         break;
-                    } else if (statusCode == 80) {
+                    } else if (statusCode == 80 || statusCode == 50) {
                         failedBuildsProjectIds.add(projectId);
                         projectRunId.put(projectId, runId);
                     }
@@ -198,13 +209,11 @@ public class Main {
 
         ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
 
-        Iterator it = accountIdsByDate.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry)it.next();
-            String key = (String)pair.getKey();
+        for (Map.Entry<String, HashSet<String>> entry : accountIdsByDate.entrySet()) {
+            String key = entry.getKey();
 
-            if (database.getCollection(key).count() == 0) {
-                HashSet<String> accountIds = (HashSet<String>) pair.getValue();
+            if (!wasDayProcessed(key)) {
+                HashSet<String> accountIds = entry.getValue();
 
                 for (String accountId : accountIds) {
                     executor.execute(() -> {
@@ -215,12 +224,15 @@ public class Main {
                             JSONObject jsonObject = jsonArr.getJSONObject(index);
                             if (jsonObject.getBoolean("isPrivateRepository")) {
                                 int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
-                                if (lastBuildGroupNumber > 0) {
-                                    String projectId = jsonObject.getString("id");
+                                String projectId = jsonObject.getString("id");
 
-                                    projectDateMap.put(projectId, key);
-                                    projectAccountIdMap.put(projectId, accountId);
+                                if (lastBuildGroupNumber > 0) {
+                                    builtProjectDateMap.put(projectId, key);
+                                } else {
+                                    nonBuiltProjectIdMap.put(projectId, key);
                                 }
+
+                                projectAccountIdMap.put(projectId, accountId);
                             }
                         }
                     });
@@ -246,12 +258,18 @@ public class Main {
         date.set(Calendar.MINUTE, 0);
         date.set(Calendar.SECOND, 0);
         date.set(Calendar.MILLISECOND, 0);
-        Date today = date.getTime();
+
+        Date curentDay = date.getTime();
+        date.add(Calendar.DAY_OF_MONTH, -1);
+        Date previousDay = date.getTime();
 
         HashSet<String> accountIds = new HashSet<>();
         HashSet<String> accIdsByDate = new HashSet<>();
 
-        String json =  makeGetRestCall("https://api.shippable.com/accountTokens?accountIds=***&isInternal=true&limit=100");
+        StringBuilder sb = new StringBuilder("https://api.shippable.com/accountTokens?accountIds=***&isInternal=true&limit=");
+        sb.append(noDaysSinceToday * 50);
+
+        String json =  makeGetRestCall(sb.toString());
         int dayIndex = 0;
 
         JSONArray jsonArr = new JSONArray(json);
@@ -264,8 +282,8 @@ public class Main {
             format.setTimeZone(TimeZone.getTimeZone("UTC"));
             Date createdAt =  format.parse(jsonObject.getString("createdAt"));
 
-            if (!createdAt.after(today)) {
-                String todayStr = getFormattedDateString(today);
+            if (createdAt.before(previousDay)) {
+                String todayStr = getFormattedDateString(previousDay);
                 accountIdsByDate.put(todayStr, new HashSet<>(accIdsByDate));
 
                 accIdsByDate.clear();
@@ -274,12 +292,15 @@ public class Main {
                     break;
                 }
 
+                curentDay = previousDay;
                 date.add(Calendar.DAY_OF_MONTH, -1);
-                today = date.getTime();
+                previousDay = date.getTime();
             }
 
-            accountIds.add(accountId);
-            accIdsByDate.add(accountId);
+            if (createdAt.after(previousDay) && createdAt.before(curentDay)) {
+                accountIds.add(accountId);
+                accIdsByDate.add(accountId);
+            }
         }
 
         return accountIds;
@@ -302,12 +323,12 @@ public class Main {
         // logger.log(Level.SEVERE, "Num other status code builds account ids = " + accountOtherStatusCodeMap.size());
         // logger.log(Level.SEVERE, "Num no YML found account ids = " + noYmlFoundAccountIds.size());
 
-        HashSet<String> set1 = getEmailIds(failedBuildsAccountIds);
+        // HashSet<String> set1 = getEmailIds(failedBuildsAccountIds);
         // HashSet<String> set2 = getEmailIds(unstableQuotaAccountIds);
         HashSet<String> set3 = getEmailIds(privateNonBuiltAccountIds);
         HashSet<String> set4 = getEmailIds(privateBuiltAccountIds);
 
-        LogEmails("Emails for failed builds AccountIds: ", set1);
+        // LogEmails("Emails for failed builds AccountIds: ", set1);
         // LogEmails("Emails for unstable Quota AccountIds: ", set2);
         LogEmails("Emails for no build runs AccountIds: ", set3);
         LogEmails("Emails for all private built AccountIds: ", set4);
@@ -645,7 +666,14 @@ public class Main {
 
     public static void connectToMongo() {
         mongoClient = new MongoClient( "localhost" , 27017 );
-        database = mongoClient.getDatabase("buildfailures");
+        failedBuildsDatabase = mongoClient.getDatabase("FailedBuildsDB");
+        greenBuildsDatabase = mongoClient.getDatabase("SuccessBuildsDB");
+        noBuildsDatabase = mongoClient.getDatabase("NoBuildsDB");
     }
 
+    public static boolean wasDayProcessed(String collection) {
+        return ((failedBuildsDatabase.getCollection(collection).count() != 0)
+                || (greenBuildsDatabase.getCollection(collection).count() != 0))
+                || (noBuildsDatabase.getCollection(collection).count() != 0);
+    }
 }
