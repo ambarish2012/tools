@@ -196,7 +196,7 @@ public class Main {
         for (Map.Entry<String, HashSet<String>> entry : accountIdsByDate.entrySet()) {
             String key = entry.getKey();
 
-            if (wasDayProcessed(key)) {
+            if (!wasDayProcessed(key)) {
                 HashSet<String> accountIds = entry.getValue();
 
                 for (String accountId : accountIds) {
