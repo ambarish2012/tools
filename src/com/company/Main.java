@@ -166,7 +166,6 @@ public class Main {
 
                     if (statusCode == 30 || statusCode == 40) {
                         failedBuildsProjectIds.remove(projectId);
-                        projectRunId.remove(projectId);
 
                         if (statusCode == 30) {
                             successfulBuildsProjectIds.add(projectId);
@@ -197,7 +196,7 @@ public class Main {
         for (Map.Entry<String, HashSet<String>> entry : accountIdsByDate.entrySet()) {
             String key = entry.getKey();
 
-            if (!wasDayProcessed(key)) {
+            if (wasDayProcessed(key)) {
                 HashSet<String> accountIds = entry.getValue();
 
                 for (String accountId : accountIds) {
