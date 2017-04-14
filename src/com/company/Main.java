@@ -58,20 +58,16 @@ public class Main {
 
         init();
 
-        if (option == 1) {
-            connectToMongo();
+        connectToMongo();
 
-            getNewAccounts(numDaysToTrack);
-            getProjectMetaData();
-            getRunStatus();
-            detectNoYml();
-            writeToMongo();
+        getNewAccounts(numDaysToTrack);
+        getProjectMetaData();
+        getRunStatus();
+        detectNoYml();
+        writeToMongo();
 
-            logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
-            logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
-        } else {
-            detectFailedBuilds(numDaysToTrack);
-        }
+        logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
+        logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
     }
 
     private static void writeToMongo() {
@@ -306,193 +302,6 @@ public class Main {
         return accountIds;
     }
 
-    public static void detectFailedBuilds(int numDays) throws ParseException{
-        HashSet<String> accountIds = getNewAccounts(numDays);
-
-        getProjectMetaData(accountIds);
-        getRunStatus(privateBuiltAccountIds);
-
-        logger.log(Level.INFO, "All Account Ids: " + accountIds.toString());
-        logger.log(Level.SEVERE, "Total number of account ids = " + accountIds.size());
-        logger.log(Level.SEVERE, "Num non-built account ids = " + privateNonBuiltAccountIds.size());
-        logger.log(Level.SEVERE, "Num built account ids = " + privateBuiltAccountIds.size());
-        logger.log(Level.SEVERE, "All built account ids = " + privateBuiltAccountIds.toString());
-        logger.log(Level.SEVERE, "All non built account ids = " + privateNonBuiltAccountIds.toString());
-        logger.log(Level.SEVERE, "Num failure builds account ids = " + failedBuildsAccountIds.size());
-        logger.log(Level.SEVERE, "Num successful builds account ids = " + successfulBuildsAccountIds.size());
-        // logger.log(Level.SEVERE, "Num other status code builds account ids = " + accountOtherStatusCodeMap.size());
-        // logger.log(Level.SEVERE, "Num no YML found account ids = " + noYmlFoundAccountIds.size());
-
-        // HashSet<String> set1 = getEmailIds(failedBuildsAccountIds);
-        // HashSet<String> set2 = getEmailIds(unstableQuotaAccountIds);
-        HashSet<String> set3 = getEmailIds(privateNonBuiltAccountIds);
-        HashSet<String> set4 = getEmailIds(privateBuiltAccountIds);
-
-        // LogEmails("Emails for failed builds AccountIds: ", set1);
-        // LogEmails("Emails for unstable Quota AccountIds: ", set2);
-        LogEmails("Emails for no build runs AccountIds: ", set3);
-        LogEmails("Emails for all private built AccountIds: ", set4);
-
-        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
-
-        for (String accountId : successfulBuildsAccountIds) {
-            executor.execute(() -> {
-                anySuccessfulRuns(accountId);
-            });
-        }
-
-        for (String accountId : failedBuildsAccountIds) {
-            executor.execute(() -> {
-                anySuccessfulRuns(accountId);
-            });
-        }
-
-        for (String accountId : failedBuildsAccountIds) {
-            executor.execute(() -> {
-                dumpConsoleLogsForFailedBuilds(accountId);
-            });
-        }
-
-        executor.shutdown();
-        try {
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException e) {
-            logger.log(Level.SEVERE, "failure in main " + e.getMessage());
-        }
-    }
-
-    private static void anySuccessfulRuns(String accountId) {
-        // get all subscription ids
-        StringBuilder url = new StringBuilder("https://api.shippable.com/subscriptionAccounts?accountIds=");
-        url.append(accountId);
-
-        String json = makeGetRestCall(url.toString());
-        HashSet<String> subscriptionIds = new HashSet<>();
-
-        // extract all subscription ids
-        JSONArray jsonArr = new JSONArray(json);
-        for (int index = 0; index < jsonArr.length(); index++) {
-            JSONObject jsonObject = jsonArr.getJSONObject(index);
-            subscriptionIds.add(jsonObject.getString("subscriptionId"));
-        }
-
-        // get all runs with status code 30 or 80
-        url = new StringBuilder("https://api.shippable.com/runs?subscriptionIds=");
-
-        boolean first = true;
-        for (String subscriptionId : subscriptionIds) {
-            if (!first) {
-                url.append(",");
-            }
-
-            url.append(subscriptionId);
-            first = false;
-        }
-
-        json = makeGetRestCall(url.toString());
-        jsonArr = new JSONArray(json);
-        HashSet<String> status30 = new HashSet<>();
-        HashSet<String> status80 = new HashSet<>();
-
-        for (int index = 0; index < jsonArr.length(); index++) {
-            JSONObject jsonObject = jsonArr.getJSONObject(index);
-
-            if (jsonObject.getBoolean("isPrivate")) {
-                int statusCode = jsonObject.getInt("statusCode");
-                String projectId = jsonObject.getString("projectId");
-                if (statusCode == 30 || statusCode == 50 || statusCode == 40) {
-                    status30.add(projectId);
-                } else if (statusCode == 80) {
-                    status80.add(projectId);
-                }
-            }
-        }
-
-        logger.log(Level.SEVERE, "Successful projects for email id = "
-                + accountEmailMap.get(accountId)
-                + " "
-                + status30.size());
-
-        logger.log(Level.SEVERE, "Failed projects for email id = "
-                + accountEmailMap.get(accountId)
-                + " "
-                + status80.size());
-    }
-
-    private static void getRunStatus(HashSet<String> accountIds) {
-        String url = "https://api.shippable.com/projects/%s/branchRunStatus";
-
-        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
-
-        Set setFailedBuildsAccountIds = Collections.synchronizedSet(failedBuildsAccountIds);
-        Set setSuccessfulBuildsAccountIds = Collections.synchronizedSet(successfulBuildsAccountIds);
-
-        for (String accounId : accountIds) {
-            executor.execute(() -> {
-                String json = makeGetRestCall(String.format(url, accountProjectIdMap.get(accounId)));
-
-                JSONArray jsonArr = new JSONArray(json);
-                for (int index = 0; index < jsonArr.length(); index++) {
-                    JSONObject jsonObject = jsonArr.getJSONObject(index);
-                    int statusCode = jsonObject.getInt("statusCode");
-
-                    if (statusCode == 30 || statusCode == 40) {
-                        setFailedBuildsAccountIds.remove(accounId);
-                        setSuccessfulBuildsAccountIds.add(accounId);
-                        break;
-                    } else if (statusCode == 80) {
-                        setFailedBuildsAccountIds.add(accounId);
-                    }
-                }
-            });
-        }
-
-        executor.shutdown();
-        try {
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException e) {
-            logger.log(Level.SEVERE, "failure in getRunStatus " + e.getMessage());
-        }
-    }
-
-    public static void getProjectMetaData(HashSet<String> accountIds) {
-        String url = "https://api.shippable.com/projects?projectIds=***&enabledBy=%s&autoBuild=true";
-
-        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newCachedThreadPool();
-
-        Set setPrivateBuiltAccountIds = Collections.synchronizedSet(privateBuiltAccountIds);
-        Set setPrivateNonBuiltAccountIds = Collections.synchronizedSet(privateNonBuiltAccountIds);
-        Map mapAccountProjectIdMap = Collections.synchronizedMap(accountProjectIdMap);
-
-        for (String accountId: accountIds) {
-            executor.execute(() -> {
-                String json = makeGetRestCall(String.format(url, accountId));
-
-                JSONArray jsonArr = new JSONArray(json);
-                for (int index = 0; index < jsonArr.length(); index++) {
-                    JSONObject jsonObject = jsonArr.getJSONObject(index);
-                    if (jsonObject.getBoolean("isPrivateRepository")) {
-                        mapAccountProjectIdMap.put(accountId, jsonObject.getString("id"));
-                        int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
-                        System.out.println(lastBuildGroupNumber);
-                        if (lastBuildGroupNumber > 0) {
-                            setPrivateBuiltAccountIds.add(accountId);
-                        } else {
-                            setPrivateNonBuiltAccountIds.add(accountId);
-                        }
-                    }
-                }
-            });
-        }
-
-        executor.shutdown();
-        try {
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException e) {
-            logger.log(Level.SEVERE, "failure in getProjectMetaData " + e.getMessage());
-        }
-    }
-
     private static String getFormattedDateString(Date date) {
         SimpleDateFormat format = new SimpleDateFormat("MM-dd-YYYY");
         return format.format(date);
@@ -522,45 +331,6 @@ public class Main {
 
         logger.addHandler(fh);
         logger.setLevel(Level.INFO);
-    }
-
-    private static void LogEmails(String msg, HashSet<String> emailIds) {
-        if ((emailIds == null) || emailIds.isEmpty())
-            return;
-
-        System.out.println(emailIds);
-        logger.log(Level.SEVERE, msg + emailIds.toString());
-    }
-
-    private static HashSet<String> getEmailIds(HashSet<String> accountIds) {
-        if (accountIds.isEmpty())
-            return null;
-
-        StringBuilder url = new StringBuilder("https://api.shippable.com/accountProfiles/?accountIds=");
-
-        boolean first = true;
-        for (String accounId : accountIds) {
-            if (!first) {
-                url.append(",");
-            }
-
-            url.append(accounId);
-            first = false;
-        }
-
-        String json = makeGetRestCall(url.toString());
-        JSONArray jsonArray = new JSONArray(json);
-
-        HashSet<String> emailIds = new HashSet<>();
-        for(int index = 0; index < jsonArray.length(); index++) {
-            String emailId = jsonArray.getJSONObject(index).getString("defaultEmailId");
-            String accountId = jsonArray.getJSONObject(index).getString("accountId");
-
-            emailIds.add(emailId);
-            accountEmailMap.put(accountId, emailId);
-        }
-
-        return emailIds;
     }
 
     private static String getEmailId(String accountId) {
