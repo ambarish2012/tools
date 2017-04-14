@@ -17,9 +17,6 @@ import java.util.logging.*;
 import org.json.*;
 
 public class Main {
-    private static HashSet<String> privateBuiltAccountIds = new HashSet<>();
-    private static HashSet<String> privateNonBuiltAccountIds = new HashSet<>();
-
     private static HashMap<String, HashSet<String>> accountIdsByDate = new HashMap<>();
     private static Map<String, HashSet<String>> privateFailedBuildProjectIdsByDate = new HashMap<>();
     private static Map<String, HashSet<String>> privateSuccessfulBuildProjectIdsByDate = new HashMap<>();
@@ -35,12 +32,9 @@ public class Main {
     private static ConcurrentHashMap<String, String> projectRunId = new ConcurrentHashMap<>();
     private static HashSet<String> noYmlFoundProjectIds = new HashSet<>();
     private static HashMap<String, String> projectIdYml = new HashMap<>();
-
-    private static HashMap<String, String> accountProjectIdMap = new HashMap<>();
     private static HashMap<String, String> accountEmailMap = new HashMap<>();
 
     private static Set<String> successfulBuildsAccountIds = ConcurrentHashMap.newKeySet();
-    private static Set<String> failedBuildsAccountIds = ConcurrentHashMap.newKeySet();
     private static HashSet<String> noYmlFoundAccountIds = new HashSet<>();
 
     private final static Logger logger = Logger.getLogger(Main.class.getName());
@@ -54,10 +48,8 @@ public class Main {
     public static void main(String[] args) throws ParseException {
         apiToken = args[0];
         int numDaysToTrack = Integer.parseInt(args[1]);
-        int option = Integer.parseInt(args[2]);
 
         init();
-
         connectToMongo();
 
         getNewAccounts(numDaysToTrack);
@@ -65,9 +57,6 @@ public class Main {
         getRunStatus();
         detectNoYml();
         writeToMongo();
-
-        logger.log(Level.SEVERE, "failed build project ids " + failedBuildsProjectIds.toString());
-        logger.log(Level.SEVERE, "No YML project ids " + noYmlFoundProjectIds.toString());
     }
 
     private static void writeToMongo() {
@@ -180,7 +169,7 @@ public class Main {
                         projectRunId.remove(projectId);
 
                         if (statusCode == 30) {
-                            successfulBuildsAccountIds.add(projectId);
+                            successfulBuildsProjectIds.add(projectId);
                         }
 
                         break;
