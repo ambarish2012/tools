@@ -34,7 +34,6 @@ public class Main {
     private static HashMap<String, String> projectIdYml = new HashMap<>();
     private static HashMap<String, String> accountEmailMap = new HashMap<>();
 
-    private static Set<String> successfulBuildsAccountIds = ConcurrentHashMap.newKeySet();
     private static HashSet<String> noYmlFoundAccountIds = new HashSet<>();
 
     private final static Logger logger = Logger.getLogger(Main.class.getName());
@@ -44,6 +43,7 @@ public class Main {
     private static MongoDatabase failedBuildsDatabase = null;
     private static MongoDatabase greenBuildsDatabase = null;
     private static MongoDatabase noBuildsDatabase = null;
+    private static MongoDatabase metaDataDatabase = null;
 
     public static void main(String[] args) throws ParseException {
         apiToken = args[0];
@@ -78,6 +78,31 @@ public class Main {
         insertMongoDocumentForCollection(privateFailedBuildProjectIdsByDate, failedBuildsDatabase);
         insertMongoDocumentForCollection(privateSuccessfulBuildProjectIdsByDate, greenBuildsDatabase);
         insertMongoDocumentForCollection(privateNonBuiltProjectIdsByDate, noBuildsDatabase);
+        writeMetaDataToMongoDB();
+    }
+
+    private static void writeMetaDataToMongoDB() {
+        MongoCollection<Document> collection = metaDataDatabase.getCollection("metaData");
+        if (collection.count() != 0) {
+            collection.drop();
+        }
+
+        if (collection.count()  == 0 ) {
+            Document doc = new Document("numSuccess", countProjects(privateSuccessfulBuildProjectIdsByDate))
+                    .append("numFail", countProjects(privateFailedBuildProjectIdsByDate))
+                    .append("numEnabled", countProjects(privateNonBuiltProjectIdsByDate));
+
+            collection.insertOne(doc);
+        }
+    }
+
+    private static int countProjects(Map<String, HashSet<String>> map) {
+        int count = 0;
+        for (Map.Entry<String, HashSet<String>> entry : map.entrySet()) {
+            count += entry.getValue().size();
+        }
+
+        return count;
     }
 
     private static void insertMongoDocumentForCollection(Map<String, HashSet<String>> map, MongoDatabase database) {
@@ -206,7 +231,7 @@ public class Main {
                         JSONArray jsonArr = new JSONArray(json);
                         for (int index = 0; index < jsonArr.length(); index++) {
                             JSONObject jsonObject = jsonArr.getJSONObject(index);
-                            if (jsonObject.getBoolean("isPrivateRepository")) {
+                            if (!jsonObject.getBoolean("isPrivateRepository")) {
                                 int lastBuildGroupNumber = jsonObject.getInt("lastBuildGroupNumber");
                                 String projectId = jsonObject.getString("id");
 
@@ -424,9 +449,10 @@ public class Main {
 
     public static void connectToMongo() {
         mongoClient = new MongoClient( "localhost" , 27017 );
-        failedBuildsDatabase = mongoClient.getDatabase("FailedBuildsDB");
-        greenBuildsDatabase = mongoClient.getDatabase("SuccessBuildsDB");
-        noBuildsDatabase = mongoClient.getDatabase("NoBuildsDB");
+        failedBuildsDatabase = mongoClient.getDatabase("osFailedBuildsDB");
+        greenBuildsDatabase = mongoClient.getDatabase("osSuccessBuildsDB");
+        noBuildsDatabase = mongoClient.getDatabase("osNoBuildsDB");
+        metaDataDatabase = mongoClient.getDatabase("osMetaDataDB");
     }
 
     public static boolean wasDayProcessed(String collection) {
